@@ -1,0 +1,33 @@
+**Node도 리소스**
+
+- Node는 동작 중인 Pod를 유지. Kubernetes container runtime 환경 제공. 모든 Node 상에서 동작
+- container를 실행하는 모든 worker node ⇒ kubelet, kube-proxy, container runtime 실행
+    
+    ⇒ kubelet: container 실행 요청을 수신하고, 필요한 리소스 관리. 
+    
+    ⇒ kube-proxy: 네트워크에 container 노출하기 위한 네트워킹 연결 관리 규칙 생성및 관리
+    
+
+**노드 조회**
+
+```bash
+$ kubectl get nodes
+$ kubectl get nodes -o wide
+
+# 노드 자세히
+$ kubectl describe nodes k8s-node1
+
+# 파드 자세히
+$ kubectl describe -n kube-system pod kube-proxy-XX
+```
+
+**조인키 조회 및 생성**
+
+```bash
+# 조인키 조회
+$ kubeadm token list
+
+# 조인키 생성(ttl 0 => 시간 제한 없음, 기본 24시간)
+$ kubeadm token create --ttl 0 --print-join-command
+kubeadm join 192.168.56.100:6443 --token vtshvt.1vi1mpkm1wdds3id --discovery-token-ca-cert-hash sha256:9083066590762bdc9a947556ed7bd05eccc74b84d9dd3e58a708d1bb384e31c5
+```
