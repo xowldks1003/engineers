@@ -1,0 +1,294 @@
+# cgroup, Calico CNI
+
+쿠버네티스는 컨테이너를 관리하는 도구고, 그 컨테이너들의 자원 사용량(CPU, 메모리 등)을 추적하려면, 런타임에서 cgroup을 설정해줘야 한다
+
+## 왜 cgroup이 필요할까?
+
+쿠버네티스는 **컨테이너 상태와 자원 사용을 모니터링하고 제한**하려고 해.
+
+그걸 위해 런타임(containerd, CRI-O 등)에 자원 제약을 요청하고:
+
+- 런타임은 컨테이너 실행 시,
+    - 리눅스 cgroup을 만들어서
+    - **해당 컨테이너의 CPU, 메모리, 블록 I/O 등 사용량을 제한 및 추적**해
+
+그 정보를 쿠버네티스가 다시 수집해서 `kubectl top`이나 메트릭 서버에서 활용할 수 있는 거야.
+
+### CNI
+
+Calico CNI는 **Kubernetes 네트워크 플러그인 중 하나**로, 단순히 네트워크 연결만 해주는 걸 넘어서 **보안 정책, 라우팅, BGP, NAT** 등 고급 네트워크 기능도 제공하는 **강력한 CNI**야.
+
+## Calico CNI란?
+
+Calico는 **Cloud Native Networking & Network Security 솔루션**으로,
+
+Kubernetes 클러스터의 Pod 간 통신을 가능하게 해주는 **CNI (Container Network Interface)** 중 하나야
+
+| 구성 요소 | 역할 |
+| --- | --- |
+| `calico-node` | Pod 간 네트워크 설정, 라우팅, IPAM 처리 |
+| `Felix` | Calico 에이전트. iptables 룰 설정, 네트워크 정책 적용 |
+| `Typha` | 대규모 클러스터에서 Felix 간 통신 최적화 (선택적) |
+| `BIRD` | BGP 라우팅 데몬 (선택적, L3 라우팅 시 사용) |
+
+| 기능 | 설명 |  |
+| --- | --- | --- |
+| **IP 주소 관리(IPAM)** | 각 Pod에 고유한 IP 부여 |  |
+| **L3 기반 네트워크** | 레이어 3 라우팅으로 Pod 간 통신 |  |
+| **네트워크 정책** | 어떤 Pod가 어떤 Pod와 통신할 수 있을지 제어 |  |
+| **BGP 라우팅 지원** | 클러스터 외부 장비와의 L3 연동 가능 |  |
+| **eBPF 모드 지원** | 고성능 패킷 필터링/처리를 위한 커널 기술 활용 가능 |  |
+
+- k8s-master: 192.168.56.100/24
+- k8s-node1: 192.168.56.101/24
+- k8s-node2: 192.168.56.102/24
+- k8s-node3: 192.168.56.103/24
+
+### master
+
+- 쿠버네티스 노드 최소 사양(4096MB, 4 core)
+
+**우분투 네트워크 설정(으악)**
+
+```bash
+# 이 설정 반드시 추가 => 재부팅되도 설정파일이 변경되지 않도록
+$ sudo vi /etc/cloud/cloud.cfg.d/99-disable-network-config.cfg
+network: {config: disabled}
+```
+
+```yaml
+# 네트워크 설정
+# 라우팅 설정할때, 반드시 default 를 빼도록 하자
+
+$ sudo vi /etc/netplan/50-cloud-init.yaml
+
+network:
+    renderer: networkd
+    ethernets:
+        enp0s3: # NAT
+            dhcp4: true
+        enp0s8: # 내부 통신용
+            dhcp4: no
+            addresses:
+              - 192.168.56.100/24
+            nameservers:
+              addresses: [8.8.8.8]
+            routes:
+              - to: 192.168.56.0/24
+                via: 192.168.56.2
+    version: 2
+```
+
+**master 환경 구성**
+
+```bash
+# SWAP 해제
+# Pod가 Swap을 사용하지 않도록 해서 성능유지(컨테이너는 프로세스 => SWAP으로 들어가게 된다면 성능이 떨어짐)
+$ sudo swapoff -a
+$ free
+$ vi /etc/fstab # swap 부분 삭제
+
+# NTP 설정: 클러스터 내의 모든 Node들은 NTP를 통해서 시간이 동기화되어야 함(ntpq 써도됨)
+$ apt install -y chrony
+$ sudo vi /etc/chrony/chrony.conf
+
+server time.google.com     iburst prefer
+server time.cloudflare.com iburst
+server time.nist.gov       iburst
+
+# 네트워크 패킷을 올바르게 포워딩 => 커널매개변수 IP 포워딩 기능 활성화
+$ sysctl -a | grep ip_forward
+$ sysctl -w net.ipv4.ip_forward=1  # /proc/sys/net/ipv4/ip_forward
+
+# containerd를 이용한 container runtime 구성(컨테이너를 실제로 실행.관리)
+$ sudo cat <<EOF | sudo tee /etc/modules-load.d/containerd.conf
+overlay      # 읽기 전용 레이어 위에 쓰기 가능한 컨테이너 레이어를 올려서 겹쳐서 관리하는 구조
+br_netfilter # 브릿지 네트워크 트래픽도 iptables로 제어 가능하도록(2계층 패킷 => 3계층 방화벽 거침)
+
+# 커널에 모듈 로드
+$ sudo modprobe overlay
+$ sudo modprobe br_netfilter
+
+# 노드간 통신을 위한 iptables에 브릿지 관련 설정 추가(커널의 iptables 모듈 활성화)
+# (https://kubernetes.io/ko/docs/setup/production-environment/container-runtimes/)
+$ sudo cat <<EOF | sudo tee **/etc/sysctl.d/99-kubernetes-cri.conf**
+net.bridge.bridge-nf-call-iptables = 1
+net.ipv4.ip_forward = 1
+net.bridge.bridge-nf-call-ip6tables = 1
+eof
+
+$ sudo cat <<EOF | sudo tee **/etc/modules-load.d/k8s.conf**
+br_netfilter
+eof
+
+$ sudo cat <<EOF | sudo tee **/etc/sysctl.d/k8s.conf**
+net.bridge.bridge-nf-call-ip6tables = 1
+net.bridge.bridge-nf-call-iptables = 1
+net.ipv4.ip_forward = 1
+eof
+
+$ sudo sysctl --system
+```
+
+**k8s의 컨테이너 런타임 설정**
+
+- Kubelet(쿠버네티스 노드 에이전트)는 컨테이너 런타임 인터페이스(CRI)를 통해서 런타임에 명령을 전달
+    
+    ⇒ 런타임은 이미지 풀링, 컨테이너 네트워크 설정, 프로세스 격리 등 실제 컨테이너 실행과 관리를 담당
+    
+    ⇒ 대표적인 런타임: containerd, CRI-O, Docker
+    
+    (https://kubernetes.io/ko/docs/setup/production-environment/container-runtimes/#containerd)
+    
+
+(https://docs.docker.com/engine/install/ubuntu/)
+
+```bash
+# apt가 HTTPS로 리포지토리를 사용하는 것을 허용하기 위한 패키지 및 docker에 필요한 패키지 설치
+$ sudo apt-get update && sudo apt-get install -y apt-transport-https ca-certificates curl software-properties-common gnupg2
+
+# Add Docker's official GPG key
+$ sudo install -m 0755 -d /etc/apt/keyrings
+$ sudo curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+$ sudo chmod a+r /etc/apt/keyrings/docker.asc
+
+# Add the repository to Apt sources:
+$ echo \
+  "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu \
+  $(. /etc/os-release && echo "${UBUNTU_CODENAME:-$VERSION_CODENAME}") stable" | \
+  sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+$ sudo apt-get update
+
+# Install Docker Packages
+# docker는 image 개발 및 테스트 용도, container runtime은 containerd만 사용
+$ sudo apt-get install docker-ce docker-ce-cli **containerd.io** docker-buildx-plugin docker-compose-plugin
+
+# containerd 설정
+$ sudo sh -c "containerd config default > /etc/containerd/config.toml"
+disabled_plugins = [] # 플러그인 전부 활성화 상태
+
+# cgroup 드라이버를 systemd로 사용하도록 설정
+$ sudo sed -i 's/ SystemdCgroup = false/ SystemdCgroup = true/' /etc/containerd/config.toml
+$ sudo systemctl restart containerd
+$ sudo docker info
+...Cgroup Driver: systemd
+
+# docker daemon 설정
+$ sudo vi /etc/docker/daemon.json
+{
+  "exec-opts": ["native.cgroupdriver=systemd"],
+  "log-driver": "json-file",
+  "log-opts": {
+    "max-size": "100m"
+  },                                                                                                                                                                                           "storage-driver": "overlay2"
+}
+$ sudo mkdir -p /etc/systemd/system/docker.service.d
+$ sudo systemctl daemon-reload
+```
+
+**kubernetes 도구 설치(1.30) (kubernetes 1.30 ⇒ Ubuntu 22.04 이후)**
+
+(https://v1-30.docs.kubernetes.io/docs/setup/production-environment/tools/kubeadm/install-kubeadm/)(릴리즈 노트)
+
+```bash
+$ curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.30/deb/Release.key | sudo gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+$ echo 'deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.30/deb/ /' | sudo tee /etc/apt/sources.list.d/kubernetes.lis
+$ sudo apt-get update
+
+# 버전 확인
+$ sudo apt-cache policy kubeadm
+kubeadm:
+  Installed: 1.30.13-1.1
+  Candidate: 1.30.13-1.1
+
+# 패키지 설치
+$ sudo apt-get install -y kubelet kubeadm kubectl
+
+# 설치된 패키지 버전 확인
+$ kubeadm version
+$ kubectl version
+$ kubelet --version
+
+# 설치된 kubernetes tool이 자동으로 업데이트되는 것 방지 => hold 시킴
+$ sudo apt-mark hold kubelet kubeadm kubectl
+```
+
+### kubernetes cluster init
+
+- init 작업하기전에 모든 노드 ⇒ **반드시 swapoff 되어있는지 확인(swap 사용중이면 에러남)**
+- pod-network-cidr (10.x.x.x) (기본값: 10.96.0.0/12) / service-cidr (20.x.x.x)
+    
+    ⇒ pod-network-cidr은 Pod 네트워크의 IP 주소 범위를 지정. 설정된 경우 control plane은 모든 노드에 대해 CIDR을 자동으로 할당
+    
+- apiserver-advertise-address는 수신 대기중임을 알릴 IP 주소, 설정하지 않으면 기본 네트워크 인터페이스. Master Node의 IP 를 설정해주면 됨
+
+```bash
+# 만약, init 작업 실패하면 kubeadm reset
+master)$ sudo kubeadm init --pod-network-cidr=10.96.0.0/12 --apiserver-advertise-address=192.168.56.100 # 약 100만개 정도
+
+# kubernetes control-plane 초기화. sudo 권한없이 kubectl 사용하기
+# admin.conf 구성파일을 통해 kubernetes 권한을 부여하여 실행하기때문에, 별도 권한 없이 지정
+
+  mkdir -p $HOME/.kube
+  sudo cp -i /etc/kubernetes/admin.conf $HOME/.kube/config
+  sudo chown $(id -u):$(id -g) $HOME/.kube/config
+
+# root 유저면 이거까지
+
+  export KUBECONFIG=/etc/kubernetes/admin.conf
+
+You should now deploy a pod network to the cluster.
+Run "kubectl apply -f [podnetwork].yaml" with one of the options listed at:
+  https://kubernetes.io/docs/concepts/cluster-administration/addons/
+
+Then you can join any number of worker nodes by running the following on each as root:
+
+# 노드를 클러스터에 조인(노드에 붙여넣기)
+kubeadm join 192.168.56.100:6443 --token muyend.cb3ajs23jgbns2sd \
+        --discovery-token-ca-cert-hash sha256:9083066590762bdc9a947556ed7bd05eccc74b84d9dd3e58a708d1bb384e31c5
+```
+
+**kubectl 자동완성 기능**
+
+```bash
+$ sudo apt install bash-completion -y
+$ source <(kubectl completion bash)
+$ echo "source <(kubectl completion bash)" >> ~/.bashrc
+$ complete -F __start_kubectl k
+```
+
+**노드, 파드 조회**
+
+```bash
+$ kubectl get nodes
+NAME         STATUS     ROLES           AGE    VERSION
+k8s-master   NotReady   control-plane   15m    v1.30.13
+k8s-node1    NotReady   <none>          117s   v1.30.13
+k8s-node2    NotReady   <none>          98s    v1.30.13
+
+# 파드조회
+# coredns 만 pending인 상태 => 정상
+$ kubectl get pod -A
+NAMESPACE     NAME                                 READY   STATUS    RESTARTS   AGE
+kube-system   coredns-55cb58b774-xchrp             0/1     Pending   0          15m
+kube-system   coredns-55cb58b774-zsh7q             0/1     Pending   0          15m
+```
+
+### Calico CNI
+
+k8s 1.30 ⇒ calico 3.29
+
+(https://docs.tigera.io/calico/3.29/getting-started/kubernetes/requirements) (릴리즈 노트 확인)
+
+(https://docs.tigera.io/calico/3.29/getting-started/kubernetes/self-managed-onprem/onpremises) (calico.yaml 다운로드)
+
+```bash
+$ curl https://raw.githubusercontent.com/projectcalico/calico/v3.29.3/manifests/calico.yaml -O
+$ kubectl apply -f calico.yaml
+
+# calico 초기화되는지 확인
+$ kubectl get pods -A
+
+# node 초기화 확인
+$ kubectl get nodes
+```
